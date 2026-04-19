@@ -111,7 +111,7 @@ function parseStandings(rows) {
   return teams;
 }
 
-function parseSchedule(rows) {
+function parseScheduleAll(rows) {
   const games = [];
   let currentDay = "";
   for (const row of rows) {
@@ -127,40 +127,92 @@ function parseSchedule(rows) {
     if (!level.includes(DIVISION_LEVEL_MATCH)) continue;
     const away = row[3] ? String(row[3]).trim() : "";
     const home = row[6] ? String(row[6]).trim() : "";
-    if (!isOHC(away) && !isOHC(home)) continue;
+    if (!away && !home) continue;
     const awayRaw = row[4] !== undefined ? String(row[4]).trim() : "";
     const homeRaw = row[7] !== undefined ? String(row[7]).trim() : "";
-    const awayScoreNum = awayRaw.match(/\d+/);
-    const homeScoreNum = homeRaw.match(/\d+/);
-    const played = awayScoreNum && homeScoreNum;
-    const isShootout = /so/i.test(awayRaw + " " + homeRaw);
-    const ohcIsHome = isOHC(home);
-    const opponent = ohcIsHome ? away : home;
-    let ohcScore = null, oppScore = null;
-    if (played) {
-      ohcScore = parseInt(ohcIsHome ? homeScoreNum[0] : awayScoreNum[0], 10);
-      oppScore = parseInt(ohcIsHome ? awayScoreNum[0] : homeScoreNum[0], 10);
-    }
-    let result = null;
-    if (played) {
-      if (ohcScore > oppScore) result = isShootout ? "SOW" : "W";
-      else if (ohcScore < oppScore) result = isShootout ? "SOL" : "L";
-      else result = "T";
-    }
+    const awayScoreMatch = awayRaw.match(/\d+/);
+    const homeScoreMatch = homeRaw.match(/\d+/);
+    const played = !!(awayScoreMatch && homeScoreMatch);
+    const awayRegScore = played ? parseInt(awayScoreMatch[0], 10) : null;
+    const homeRegScore = played ? parseInt(homeScoreMatch[0], 10) : null;
+    const awayHasSO = /so/i.test(awayRaw);
+    const homeHasSO = /so/i.test(homeRaw);
+    const isShootout = awayHasSO || homeHasSO;
     games.push({
       gameNum,
       day: currentDay,
       time: row[1] ? String(row[1]).trim() : "",
       arena: row[8] ? String(row[8]).trim() : "",
-      opponent,
-      ohcIsHome,
-      ohcScore,
-      oppScore,
+      away,
+      home,
+      awayRegScore,
+      homeRegScore,
+      awayHasSO,
+      homeHasSO,
       played,
-      result,
+      isShootout,
     });
   }
   games.sort((a, b) => a.gameNum - b.gameNum);
+  return games;
+}
+
+function teamMatches(cellName, targetName) {
+  if (!cellName || !targetName) return false;
+  if (OHC_ALIASES.some(a => normalize(targetName).includes(a))) {
+    return isOHC(cellName);
+  }
+  return normalize(cellName) === normalize(targetName);
+}
+
+function teamGamesView(allGames, teamName) {
+  const games = [];
+  for (const g of allGames) {
+    const ourIsAway = teamMatches(g.away, teamName);
+    const ourIsHome = teamMatches(g.home, teamName);
+    if (!ourIsAway && !ourIsHome) continue;
+    const opponent = ourIsHome ? g.away : g.home;
+    let ourScore = null, oppScore = null, result = null;
+    if (g.played) {
+      const ourReg = ourIsHome ? g.homeRegScore : g.awayRegScore;
+      const oppReg = ourIsHome ? g.awayRegScore : g.homeRegScore;
+      const ourSOMark = ourIsHome ? g.homeHasSO : g.awayHasSO;
+      const oppSOMark = ourIsHome ? g.awayHasSO : g.homeHasSO;
+      if (g.isShootout && ourReg === oppReg) {
+        if (ourSOMark && !oppSOMark) {
+          ourScore = ourReg + 1;
+          oppScore = oppReg;
+          result = "SOW";
+        } else if (oppSOMark && !ourSOMark) {
+          ourScore = ourReg;
+          oppScore = oppReg + 1;
+          result = "SOL";
+        } else {
+          ourScore = ourReg;
+          oppScore = oppReg;
+          result = "T";
+        }
+      } else {
+        ourScore = ourReg;
+        oppScore = oppReg;
+        if (ourScore > oppScore) result = g.isShootout ? "SOW" : "W";
+        else if (ourScore < oppScore) result = g.isShootout ? "SOL" : "L";
+        else result = "T";
+      }
+    }
+    games.push({
+      gameNum: g.gameNum,
+      day: g.day,
+      time: g.time,
+      arena: g.arena,
+      opponent,
+      ourIsHome,
+      ourScore,
+      oppScore,
+      played: g.played,
+      result,
+    });
+  }
   return games;
 }
 
@@ -172,11 +224,12 @@ function formatTime() {
 
 function OHCTournamentDashboard() {
   const [standings, setStandings] = useState([]);
-  const [games, setGames] = useState([]);
+  const [allGames, setAllGames] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [selectedTeam, setSelectedTeam] = useState(null);
 
   const load = useCallback(async () => {
     setIsRefreshing(true);
@@ -186,9 +239,9 @@ function OHCTournamentDashboard() {
         fetchSheetRows(SCHEDULE_SHEET_ID),
       ]);
       const parsedStandings = parseStandings(standingsRows);
-      const parsedGames = parseSchedule(scheduleRows);
+      const parsedGames = parseScheduleAll(scheduleRows);
       setStandings(parsedStandings);
-      setGames(parsedGames);
+      setAllGames(parsedGames);
       setLastUpdated(formatTime());
       setError(null);
     } catch (e) {
@@ -211,7 +264,19 @@ function OHCTournamentDashboard() {
   }, [load]);
 
   const ohcRow = standings.find(t => isOHC(t.team));
-  const ohcPosition = ohcRow ? standings.findIndex(t => t === ohcRow) + 1 : null;
+
+  useEffect(() => {
+    if (!selectedTeam && ohcRow) setSelectedTeam(ohcRow.team);
+  }, [selectedTeam, ohcRow]);
+
+  const activeTeamName = selectedTeam || (ohcRow && ohcRow.team);
+  const teamRow = activeTeamName ? standings.find(t => teamMatches(t.team, activeTeamName)) : null;
+  const teamPosition = teamRow ? standings.findIndex(t => t === teamRow) + 1 : null;
+  const teamIsOHC = !!(teamRow && isOHC(teamRow.team));
+  const games = useMemo(
+    () => (activeTeamName ? teamGamesView(allGames, activeTeamName) : []),
+    [allGames, activeTeamName]
+  );
   const playedGames = games.filter(g => g.played);
   const upcomingGames = games.filter(g => !g.played);
 
@@ -227,24 +292,36 @@ function OHCTournamentDashboard() {
     }}>
       <GlobalStyles />
       <Header lastUpdated={lastUpdated} isRefreshing={isRefreshing} onRefresh={load} error={error} />
-      {ohcRow && <OHCSummary ohcRow={ohcRow} ohcPosition={ohcPosition} totalTeams={standings.length} gamesPlayed={playedGames.length} />}
+      {teamRow && (
+        <TeamSummary
+          teamRow={teamRow}
+          teamPosition={teamPosition}
+          totalTeams={standings.length}
+          isOHC={teamIsOHC}
+          onBackToOHC={ohcRow ? () => setSelectedTeam(ohcRow.team) : null}
+        />
+      )}
       {playedGames.length > 0 && (
         <Section title="Played" subtitle={playedGames.length + " games"}>
           <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-            {playedGames.map(g => <GameCard key={g.gameNum} game={g} />)}
+            {playedGames.map(g => <GameCard key={g.gameNum} game={g} teamIsOHC={teamIsOHC} teamName={teamRow ? teamRow.team : ""} />)}
           </div>
         </Section>
       )}
       {upcomingGames.length > 0 && (
         <Section title="Upcoming" subtitle={upcomingGames.length + " scheduled"}>
           <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-            {upcomingGames.map(g => <GameCard key={g.gameNum} game={g} />)}
+            {upcomingGames.map(g => <GameCard key={g.gameNum} game={g} teamIsOHC={teamIsOHC} teamName={teamRow ? teamRow.team : ""} />)}
           </div>
         </Section>
       )}
       {standings.length > 0 && (
-        <Section title="Standings" subtitle="2012 D3 Contact">
-          <StandingsTable standings={standings} />
+        <Section title="Standings" subtitle="2012 D3 Contact · tap a team">
+          <StandingsTable
+            standings={standings}
+            selectedTeam={activeTeamName}
+            onSelect={(team) => setSelectedTeam(team)}
+          />
         </Section>
       )}
       <Footer lastUpdated={lastUpdated} />
@@ -267,6 +344,17 @@ function GlobalStyles() {
     .ohc-row {
       background: linear-gradient(90deg, rgba(239, 68, 68, 0.18) 0%, rgba(239, 68, 68, 0.04) 100%);
       border-left: 3px solid #ef4444;
+    }
+    .team-row { cursor: pointer; transition: background 0.15s ease; }
+    .team-row:hover { background: rgba(148, 184, 214, 0.06); }
+    .team-row:focus { outline: none; background: rgba(148, 184, 214, 0.08); }
+    .ohc-row.team-row:hover { background: linear-gradient(90deg, rgba(239, 68, 68, 0.26) 0%, rgba(239, 68, 68, 0.08) 100%); }
+    .selected-row {
+      background: linear-gradient(90deg, rgba(59, 130, 246, 0.18) 0%, rgba(59, 130, 246, 0.04) 100%) !important;
+      border-left: 3px solid #3b82f6;
+    }
+    .selected-row.team-row:hover {
+      background: linear-gradient(90deg, rgba(59, 130, 246, 0.26) 0%, rgba(59, 130, 246, 0.08) 100%) !important;
     }
     .glow-red { box-shadow: 0 0 40px rgba(239, 68, 68, 0.15), inset 0 1px 0 rgba(255, 255, 255, 0.05); }
     .ice-edge {
@@ -390,16 +478,34 @@ function Header({ lastUpdated, isRefreshing, onRefresh, error }) {
   );
 }
 
-function OHCSummary({ ohcRow, ohcPosition, totalTeams, gamesPlayed }) {
+function TeamSummary({ teamRow, teamPosition, totalTeams, isOHC, onBackToOHC }) {
   const suffix = (n) => {
     if (n === 1) return "st";
     if (n === 2) return "nd";
     if (n === 3) return "rd";
     return "th";
   };
+  const accent = isOHC ? "#ef4444" : "#94b8d6";
   return (
     <div style={{ padding: "20px" }}>
-      <div className="scoreboard glow-red" style={{ borderRadius: "12px", padding: "22px 20px" }}>
+      <div className={"scoreboard" + (isOHC ? " glow-red" : "")} style={{ borderRadius: "12px", padding: "22px 20px" }}>
+        <div style={{
+          display: "flex", justifyContent: "space-between",
+          alignItems: "center", marginBottom: "14px",
+          gap: "10px", flexWrap: "wrap",
+        }}>
+          <div className="display-font" style={{
+            fontSize: "22px", lineHeight: "1.1", color: "#ffffff",
+            letterSpacing: "0.02em",
+          }}>
+            {teamRow.team.toUpperCase()}
+          </div>
+          {!isOHC && onBackToOHC && (
+            <button className="refresh-btn" onClick={onBackToOHC}>
+              <span>&larr;</span> Back to OHC
+            </button>
+          )}
+        </div>
         <div style={{
           display: "flex", justifyContent: "space-between",
           alignItems: "flex-start", marginBottom: "18px",
@@ -413,7 +519,7 @@ function OHCSummary({ ohcRow, ohcPosition, totalTeams, gamesPlayed }) {
               Current Standing
             </div>
             <div className="display-font" style={{ fontSize: "48px", lineHeight: "1", color: "#ffffff" }}>
-              {ohcPosition}<span style={{ fontSize: "22px", color: "#ef4444" }}>{suffix(ohcPosition)}</span>
+              {teamPosition}<span style={{ fontSize: "22px", color: accent }}>{suffix(teamPosition)}</span>
             </div>
             <div className="heading-font" style={{
               fontSize: "11px", color: "#94b8d6",
@@ -430,8 +536,8 @@ function OHCSummary({ ohcRow, ohcPosition, totalTeams, gamesPlayed }) {
             }}>
               Points
             </div>
-            <div className="display-font" style={{ fontSize: "48px", lineHeight: "1", color: "#ef4444" }}>
-              {ohcRow.pts}
+            <div className="display-font" style={{ fontSize: "48px", lineHeight: "1", color: accent }}>
+              {teamRow.pts}
             </div>
           </div>
         </div>
@@ -440,10 +546,10 @@ function OHCSummary({ ohcRow, ohcPosition, totalTeams, gamesPlayed }) {
           gap: "8px", paddingTop: "16px",
           borderTop: "1px solid rgba(148, 184, 214, 0.12)",
         }}>
-          <Stat label={"Record"} value={ohcRow.w + "-" + ohcRow.sow + "-" + ohcRow.l} accent={"#10b981"} />
-          <Stat label="GF" value={ohcRow.gf} accent="#ffffff" />
-          <Stat label="GA" value={ohcRow.ga} accent="#ffffff" />
-          <Stat label="Diff" value={(ohcRow.gd >= 0 ? "+" : "") + ohcRow.gd} accent={ohcRow.gd >= 0 ? "#10b981" : "#f87171"} />
+          <Stat label="Record" value={teamRow.w + "-" + teamRow.sow + "-" + teamRow.l} accent="#10b981" />
+          <Stat label="GF" value={teamRow.gf} accent="#ffffff" />
+          <Stat label="GA" value={teamRow.ga} accent="#ffffff" />
+          <Stat label="Diff" value={(teamRow.gd >= 0 ? "+" : "") + teamRow.gd} accent={teamRow.gd >= 0 ? "#10b981" : "#f87171"} />
         </div>
       </div>
     </div>
@@ -493,7 +599,7 @@ function Section({ title, subtitle, children }) {
   );
 }
 
-function GameCard({ game }) {
+function GameCard({ game, teamIsOHC, teamName }) {
   const badgeMap = {
     W: { cls: "win-badge", label: "WIN" },
     SOW: { cls: "sow-badge", label: "SO WIN" },
@@ -503,6 +609,8 @@ function GameCard({ game }) {
   };
   const isWin = game.result === "W" || game.result === "SOW";
   const badge = game.played ? badgeMap[game.result] : { cls: "upcoming-badge", label: "UPCOMING" };
+  const ourLabel = teamIsOHC ? "OHC" : (teamName ? teamName.toUpperCase() : "TEAM");
+  const ourColor = teamIsOHC ? "#ef4444" : "#94b8d6";
   return (
     <div className="ice-edge" style={{ borderRadius: "10px", padding: "14px 16px" }}>
       <div style={{
@@ -517,7 +625,7 @@ function GameCard({ game }) {
             Game {game.gameNum} · {game.day}
           </div>
           <div style={{ fontSize: "11.5px", color: "#94b8d6", marginTop: "2px" }}>
-            {game.time}{game.arena ? " · " + game.arena : ""}{game.ohcIsHome ? " · Home" : " · Away"}
+            {game.time}{game.arena ? " · " + game.arena : ""}{game.ourIsHome ? " · Home" : " · Away"}
           </div>
         </div>
         <span className={badge.cls + " heading-font"} style={{
@@ -532,18 +640,19 @@ function GameCard({ game }) {
         display: "grid", gridTemplateColumns: "1fr auto 1fr",
         gap: "12px", alignItems: "center",
       }}>
-        <div style={{ textAlign: "left" }}>
+        <div style={{ textAlign: "left", minWidth: 0 }}>
           <div className="heading-font" style={{
-            fontSize: "11px", color: "#ef4444",
+            fontSize: "11px", color: ourColor,
             letterSpacing: "0.08em", textTransform: "uppercase", fontWeight: 600,
+            whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
           }}>
-            OHC
+            {ourLabel}
           </div>
           <div className="display-font" style={{
             fontSize: "36px", lineHeight: "1",
             color: game.played ? (isWin ? "#34d399" : "#94b8d6") : "#475569",
           }}>
-            {game.played ? game.ohcScore : "-"}
+            {game.played ? game.ourScore : "-"}
           </div>
         </div>
         <div className="display-font" style={{
@@ -551,10 +660,11 @@ function GameCard({ game }) {
         }}>
           VS
         </div>
-        <div style={{ textAlign: "right" }}>
+        <div style={{ textAlign: "right", minWidth: 0 }}>
           <div className="heading-font" style={{
             fontSize: "11px", color: "#94b8d6",
             letterSpacing: "0.05em", fontWeight: 500,
+            whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
           }}>
             {game.opponent.toUpperCase()}
           </div>
@@ -569,7 +679,7 @@ function GameCard({ game }) {
   );
 }
 
-function StandingsTable({ standings }) {
+function StandingsTable({ standings, selectedTeam, onSelect }) {
   return (
     <>
       <div className="ice-edge" style={{ borderRadius: "10px", overflow: "hidden" }}>
@@ -579,6 +689,7 @@ function StandingsTable({ standings }) {
               <th style={{ width: "28px" }}>#</th>
               <th>Team</th>
               <th>GP</th>
+              <th>Rec</th>
               <th>Pts</th>
               <th>Diff</th>
             </tr>
@@ -586,19 +697,40 @@ function StandingsTable({ standings }) {
           <tbody>
             {standings.map((t, i) => {
               const ohc = isOHC(t.team);
+              const isSelected = selectedTeam && normalize(t.team) === normalize(selectedTeam);
               const posClass = ohc ? "pos-ohc" : i < 3 ? "pos-top3" : i < 8 ? "pos-top8" : "pos-rest";
+              const rowClass = [
+                "team-row",
+                ohc ? "ohc-row" : "",
+                isSelected && !ohc ? "selected-row" : "",
+              ].filter(Boolean).join(" ");
               return (
-                <tr key={t.team + i} className={ohc ? "ohc-row" : ""}>
+                <tr
+                  key={t.team + i}
+                  className={rowClass}
+                  onClick={() => onSelect && onSelect(t.team)}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      onSelect && onSelect(t.team);
+                    }
+                  }}
+                >
                   <td><span className={"pos-badge " + posClass}>{i + 1}</span></td>
                   <td style={{
-                    fontWeight: ohc ? 700 : 500,
-                    color: ohc ? "#ffffff" : "#cbd5e1",
+                    fontWeight: ohc || isSelected ? 700 : 500,
+                    color: ohc || isSelected ? "#ffffff" : "#cbd5e1",
                     fontSize: "12.5px",
                   }}>
                     {t.team}
                   </td>
                   <td className="mono-font" style={{ color: "#94b8d6", fontSize: "12px" }}>
                     {t.gp}
+                  </td>
+                  <td className="mono-font" style={{ color: "#cbd5e1", fontSize: "12px", whiteSpace: "nowrap" }}>
+                    {t.w}-{t.sow}-{t.l}
                   </td>
                   <td className="display-font" style={{
                     fontSize: "17px", color: ohc ? "#ef4444" : "#ffffff",
@@ -626,6 +758,9 @@ function StandingsTable({ standings }) {
         <LegendDot color="linear-gradient(135deg, #fbbf24, #d97706)" label="Top 3" />
         <LegendDot color="rgba(59, 130, 246, 0.4)" label="Top 8" />
         <LegendDot color="linear-gradient(135deg, #ef4444, #b91c1c)" label="OHC" />
+        <span style={{ color: "#56728c", textTransform: "none", letterSpacing: 0 }}>
+          Record shows W-SOW-L
+        </span>
       </div>
     </>
   );
